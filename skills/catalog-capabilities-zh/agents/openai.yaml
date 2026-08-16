@@ -1,0 +1,7 @@
+interface:
+  display_name: "中文能力目录与安装助手"
+  short_description: "编排现有安装器，并为技能、插件和市场能力维护可核验的中文说明目录"
+  default_prompt: "使用 $catalog-capabilities-zh 扫描已有能力，或安装我提供的技能链接并补充中文说明。"
+
+policy:
+  allow_implicit_invocation: true
