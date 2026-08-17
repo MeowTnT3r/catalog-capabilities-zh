@@ -456,5 +456,185 @@ class GithubInspectionTests(unittest.TestCase):
                 catalog.parse_github_url(url)
 
 
+class DshAdapterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.dsh_home = self.root / ".dsh"
+        self.skills = self.dsh_home / "skills"
+        self.profile = self.dsh_home / "profiles" / "web"
+        self.node_modules = self.profile / "node_modules"
+        self.config_path = self.root / "config.json"
+        self.catalog_path = self.root / "能力说明.md"
+
+        CatalogFixture.write_skill(self.skills / "demo", "demo", "Demo DSH skill.")
+        demo_plugin = self.node_modules / "demo-plugin"
+        demo_plugin.mkdir(parents=True)
+        (demo_plugin / "package.json").write_text(json.dumps({
+            "name": "demo-plugin",
+            "version": "1.2.0",
+            "description": "Demo DSH bundle plugin.",
+            "repository": {"url": "https://github.com/example/demo-plugin.git"},
+            "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+            "dshx": {"contributes": {"tools": ["demo_tool"], "skills": ["demo-child"]}},
+        }), encoding="utf-8")
+        (demo_plugin / "cordis.patch.yml").write_text(
+            "- insert:\n    - id: demo-plugin\n      name: demo-plugin\n", encoding="utf-8"
+        )
+        plain_plugin = self.node_modules / "plain-plugin"
+        plain_plugin.mkdir(parents=True)
+        (plain_plugin / "package.json").write_text(json.dumps({
+            "name": "plain-plugin",
+            "version": "0.5.0",
+            "description": "Installed but not activated.",
+            "dsh": {"client": {"platform": "web"}},
+        }), encoding="utf-8")
+        self.profile.mkdir(parents=True, exist_ok=True)
+        (self.profile / "package.json").write_text(json.dumps({
+            "name": "web",
+            "dependencies": {"demo-plugin": "1.2.0", "plain-plugin": "0.5.0"},
+            "dsh": {"profile": {"bundles": ["demo-plugin"]}},
+        }), encoding="utf-8")
+        (self.profile / "cordis.patch.yml").write_text(
+            "- insert:\n    - id: extra\n      name: 'patch-mounted-plugin'\n", encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def dsh_profile(self) -> dict:
+        return {
+            "agent": "dsh",
+            "skill_roots": [{"path": str(self.skills), "alias": "skills-1"}],
+            "plugin_roots": [{"path": str(self.node_modules), "alias": "plugins-1"}],
+            "dsh_home": str(self.dsh_home),
+            "dsh_profile": "web",
+            "dsh_config": str(self.profile / "package.json"),
+            "dsh_patch": str(self.profile / "cordis.patch.yml"),
+            "catalog_path": str(self.catalog_path),
+            "include_system": False,
+        }
+
+    def test_discover_reports_dsh_roots_and_skips_codex_home(self) -> None:
+        result = catalog.discover_paths(self.config_path, dsh_home=str(self.dsh_home))
+        paths = {item["path"] for item in result["candidates"]}
+        reasons = {item["reason"] for item in result["candidates"]}
+        self.assertIn(str(self.skills.resolve()), paths)
+        self.assertIn(str(self.node_modules.resolve()), paths)
+        self.assertIn(str((self.profile / "package.json").resolve()), paths)
+        self.assertFalse(any("Codex standard directory" in reason for reason in reasons))
+
+    def test_scan_dsh_distinguishes_enabled_installed_and_skill(self) -> None:
+        inventory = catalog.scan_profile("default", self.dsh_profile())
+        by_name = {item["name"]: item for item in inventory["items"]}
+        self.assertEqual(by_name["demo-plugin"]["status"], "enabled")
+        self.assertEqual(by_name["demo-plugin"]["ecosystem"], "dsh")
+        self.assertEqual(by_name["demo-plugin"]["source_url"], "https://github.com/example/demo-plugin")
+        self.assertIn("demo_tool", by_name["demo-plugin"]["capabilities"])
+        self.assertEqual(by_name["plain-plugin"]["status"], "installed")
+        self.assertEqual(by_name["demo"]["status"], "installed")
+        self.assertEqual(by_name["demo"]["ecosystem"], "dsh")
+        declared = next(item for item in inventory["items"] if item["name"] == "demo-child")
+        self.assertEqual(declared["kind"], "plugin_skill")
+        self.assertEqual(declared["status"], "enabled")
+
+    def test_configure_cli_writes_dsh_profile(self) -> None:
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = catalog.main([
+                "configure",
+                "--config", str(self.config_path),
+                "--agent", "dsh",
+                "--dsh-home", str(self.dsh_home),
+                "--dsh-profile", "web",
+                "--catalog", str(self.catalog_path),
+            ])
+        self.assertEqual(code, 0)
+        loaded = json.loads(self.config_path.read_text(encoding="utf-8"))
+        profile = loaded["profiles"]["default"]
+        self.assertEqual(profile["agent"], "dsh")
+        self.assertEqual(profile["dsh_profile"], "web")
+        self.assertIn(str(self.skills.resolve()), {item["path"] for item in profile["skill_roots"]})
+        self.assertIn(str(self.node_modules.resolve()), {item["path"] for item in profile["plugin_roots"]})
+
+    def test_profile_directory_root_reaches_node_modules_without_fake_plugin(self) -> None:
+        profile = self.dsh_profile()
+        profile["plugin_roots"] = [{"path": str(self.profile), "alias": "profile-1"}]
+        inventory = catalog.scan_profile("default", profile)
+        names = {item["name"] for item in inventory["items"]}
+        self.assertIn("demo-plugin", names)
+        self.assertNotIn("web", names)
+
+    def test_global_fallback_bundle_uses_selected_profile_state(self) -> None:
+        fallback_root = self.dsh_home / "profiles" / "node_modules"
+        builtin = fallback_root / "@deepseek-ai" / "dsh-base"
+        builtin.mkdir(parents=True)
+        (builtin / "package.json").write_text(json.dumps({
+            "name": "@deepseek-ai/dsh-base",
+            "version": "0.1.0-rc.6",
+            "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+        }), encoding="utf-8")
+        manifest = json.loads((self.profile / "package.json").read_text(encoding="utf-8"))
+        manifest["dsh"]["profile"]["bundles"].append("@deepseek-ai/dsh-base")
+        (self.profile / "package.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        profile = self.dsh_profile()
+        profile["plugin_roots"] = [{"path": str(fallback_root), "alias": "fallback"}]
+        inventory = catalog.scan_profile("default", profile)
+
+        builtin_item = next(item for item in inventory["items"] if item["name"] == "@deepseek-ai/dsh-base")
+        self.assertEqual(builtin_item["status"], "enabled")
+
+    def test_runtime_skill_metadata_path_wins_over_codex_skill_copy(self) -> None:
+        plugin = self.node_modules / "demo-plugin"
+        manifest_path = plugin / "package.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["dshx"]["contributes"]["skillPaths"] = {
+            "demo-child": "dsh/demo-child/SKILL.md",
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        CatalogFixture.write_skill(
+            plugin / "skills" / "demo-child",
+            "demo-child",
+            "Codex-facing description.",
+        )
+        CatalogFixture.write_skill(
+            plugin / "dsh" / "demo-child",
+            "demo-child",
+            "DeepSeek Harness runtime description.",
+        )
+
+        inventory = catalog.scan_profile("default", self.dsh_profile())
+        skill = next(
+            item for item in inventory["items"]
+            if item["kind"] == "plugin_skill" and item["name"] == "demo-child"
+        )
+
+        self.assertEqual(skill["description_original"], "DeepSeek Harness runtime description.")
+        self.assertEqual(Path(skill["path"]), (plugin / "dsh" / "demo-child").resolve())
+
+    def test_dsh_installer_resolution(self) -> None:
+        skill = catalog.installer_resolution("dsh", "skill", [])
+        self.assertTrue(skill["supported"])
+        self.assertFalse(skill["supports_direct_install"])
+        self.assertEqual(skill["trusted_installer"], "none")
+        plugin = catalog.installer_resolution("dsh", "plugin", [])
+        self.assertTrue(plugin["supported"])
+        self.assertIn("dsh plugin", plugin["trusted_installer"])
+
+
+class DshPackagingTests(unittest.TestCase):
+    def test_windows_space_path_workaround_is_documented(self) -> None:
+        readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Windows 本地路径包含空格", readme)
+        self.assertIn("npm pack", readme)
+        self.assertIn("无空格路径", readme)
+
+    def test_runtime_only_plugin_has_no_unused_peer_dependencies(self) -> None:
+        package = json.loads((Path(__file__).parents[1] / "package.json").read_text(encoding="utf-8"))
+        self.assertNotIn("peerDependencies", package)
+
+
+
 if __name__ == "__main__":
     unittest.main()

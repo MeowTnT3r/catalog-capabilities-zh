@@ -1,0 +1,15 @@
+{
+  "id": "catalog-capabilities-zh",
+  "version": "1.0.0",
+  "main": "./lib/index.js",
+  "description": "为 DeepSeek Harness 维护可核验的中文能力目录，并编排 DSH 技能与插件的安装、扫描、查找和说明撰写。",
+  "engines": {
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "contributes": {
+    "tools": [],
+    "skills": [
+      "catalog-capabilities-zh"
+    ]
+  }
+}

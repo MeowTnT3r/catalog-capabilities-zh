@@ -1,0 +1,55 @@
+{
+  "name": "catalog-capabilities-zh",
+  "version": "1.0.0",
+  "description": "DSH plugin adapter of catalog-capabilities-zh: orchestrates DeepSeek Harness plugins/skills installation and maintains a searchable Chinese capability catalog.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "dsh/SKILL.md",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "skills/catalog-capabilities-zh/SKILL.md",
+    "skills/catalog-capabilities-zh/agents/openai.yaml",
+    "skills/catalog-capabilities-zh/scripts/catalog_capabilities.py",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "skill",
+    "catalog",
+    "capabilities"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MeowTnT3r/catalog-capabilities-zh.git"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dshx": {
+    "contributes": {
+      "tools": [],
+      "skills": [
+        "catalog-capabilities-zh"
+      ],
+      "skillPaths": {
+        "catalog-capabilities-zh": "dsh/SKILL.md"
+      }
+    }
+  }
+}

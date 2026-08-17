@@ -1,0 +1,13 @@
+# catalog-capabilities-zh bundle patch.
+#
+# This file is the `dsh.bundle.patch` layer of the DeepSeek Harness plugin.
+# Install the plugin with the official CLI:
+#
+#   dsh plugin --profile web add github:MeowTnT3r/catalog-capabilities-zh
+#
+# The CLI reconciles `dsh.profile.bundles` against installed packages and,
+# seeing the `dsh.bundle` declaration in package.json, appends this package
+# to the bundle stack. Profile boot then merges this single insert below.
+- insert:
+    - id: catalog-capabilities-zh
+      name: 'catalog-capabilities-zh'

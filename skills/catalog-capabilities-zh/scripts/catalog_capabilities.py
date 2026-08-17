@@ -44,7 +44,19 @@ AGENT_ADAPTERS: dict[str, dict[str, Any]] = {
         "plugin_installer": "plugin-management",
         "supports_plugins": True,
         "verification": "rescan-local-metadata",
-    }
+    },
+    "dsh": {
+        "skill_installer": "none",
+        "plugin_installer": "dsh plugin --profile <profile> add <package-or-github-url>",
+        "supports_plugins": True,
+        "verification": "rescan-local-metadata",
+        "skill_install_note": (
+            "DeepSeek Harness has no separate skill installer command. Install a "
+            "skill-only repository by copying its SKILL.md directory into "
+            "$DSH_HOME/skills after user approval, or install it as a DSH bundle "
+            "plugin with `dsh plugin --profile <profile> add <target>`."
+        ),
+    },
 }
 
 CATEGORY_ORDER = [
@@ -56,6 +68,7 @@ CATEGORY_ORDER = [
     "研究与知识管理",
     "自动化与工作流",
     "外部服务与集成",
+    "DeepSeek Harness 系统与扩展",
     "Codex 系统与扩展",
     "其他",
 ]
@@ -67,6 +80,7 @@ CATEGORY_RULES = [
     ("研究与知识管理", ("research", "notion", "zotero", "knowledge", "研究", "知识")),
     ("自动化与工作流", ("automat", "workflow", "calendar", "asana", "linear", "任务", "工作流", "自动化")),
     ("外部服务与集成", ("plugin", "marketplace", "github", "slack", "gmail", "drive", "cloudflare", "vercel", "stripe", "supabase", "集成", "插件", "市场")),
+    ("DeepSeek Harness 系统与扩展", ("deepseek", "dsh", "harness", "dsh-home")),
     ("Codex 系统与扩展", ("codex", "skill", "agent", "installer", "catalog", "能力目录", "技能")),
     ("开发与代码", ("code", "coding", "program", "api", "database", "prototype", "代码", "开发", "编程")),
 ]
@@ -422,41 +436,135 @@ def candidate(path: Path, kind: str, reason: str, filename: str) -> dict[str, An
     }
 
 
-def discover_paths(config_path: Path, codex_home: str | None = None) -> dict[str, Any]:
+def dsh_home_dir(explicit: str | None = None) -> Path:
+    return canonical_path(explicit or os.environ.get("DSH_HOME") or Path.home() / ".dsh")
+
+
+def dsh_profile_dir(home: Path | str, profile: str) -> Path:
+    return canonical_path(home) / "profiles" / (profile or "web")
+
+
+def dsh_plugin_roots(home: Path | str, preferred_profile: str = "web") -> list[tuple[Path, str]]:
+    """Return one plugin root per initialized DSH profile, preferring node_modules."""
+    home_path = canonical_path(home)
+    profiles = home_path / "profiles"
+    roots: list[tuple[Path, str]] = []
+    if profiles.is_dir():
+        for child in sorted(profiles.iterdir(), key=lambda item: item.name.lower()):
+            if not child.is_dir():
+                continue
+            node_modules = child / "node_modules"
+            roots.append((node_modules if node_modules.is_dir() else child, child.name))
+    if not roots:
+        roots.append((dsh_profile_dir(home_path, preferred_profile), preferred_profile))
+    return roots
+
+
+def iter_top_level_dsh_packages(root: Path) -> Iterator[Path]:
+    """Yield top-level package directories without descending into dependency trees."""
+    if not root.is_dir():
+        return
+    if (root / "package.json").is_file():
+        if root.parent.name == "profiles":
+            node_modules = root / "node_modules"
+            if node_modules.is_dir():
+                yield from iter_top_level_dsh_packages(node_modules)
+            return
+        yield root
+        return
+    if root.name == "node_modules":
+        for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+            if not child.is_dir():
+                continue
+            if child.name.startswith("@"):
+                for scoped in sorted(child.iterdir(), key=lambda item: item.name.lower()):
+                    if scoped.is_dir() and (scoped / "package.json").is_file():
+                        yield scoped
+            elif (child / "package.json").is_file():
+                yield child
+        return
+    for child in sorted(root.iterdir(), key=lambda item: item.name.lower()):
+        if not child.is_dir():
+            continue
+        if child.name == "node_modules":
+            yield from iter_top_level_dsh_packages(child)
+        elif (child / "node_modules").is_dir():
+            yield from iter_top_level_dsh_packages(child / "node_modules")
+
+
+def dsh_package_count(root: Path, limit: int = 10_000) -> int:
+    count = 0
+    for _ in iter_top_level_dsh_packages(root):
+        count += 1
+        if count >= limit:
+            break
+    return count
+
+
+def discover_paths(
+    config_path: Path,
+    codex_home: str | None = None,
+    dsh_home: str | None = None,
+) -> dict[str, Any]:
     found: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     diagnostics: list[str] = []
 
-    def add(path: Path, kind: str, reason: str, filename: str) -> None:
+    def add(path: Path, kind: str, reason: str, filename: str, item_count: int | None = None) -> None:
         key = (kind, os.path.normcase(str(path.resolve(strict=False))))
         if key not in seen:
             seen.add(key)
-            found.append(candidate(path, kind, reason, filename))
+            entry = candidate(path, kind, reason, filename)
+            if item_count is not None:
+                entry["item_count"] = item_count
+            found.append(entry)
 
     try:
         config = load_config(config_path)
     except CatalogError as exc:
         config = empty_config()
         diagnostics.append(str(exc))
-    if not codex_home:
+    if not codex_home and not dsh_home:
         for profile_name, profile in config.get("profiles", {}).items():
             for entry in normalize_root_entries(profile.get("skill_roots", []), "skills"):
                 add(Path(entry["path"]), "skills", f"saved profile {profile_name}", "SKILL.md")
             for entry in normalize_root_entries(profile.get("plugin_roots", []), "plugins"):
-                add(Path(entry["path"]), "plugins", f"saved profile {profile_name}", "plugin.json")
+                add(Path(entry["path"]), "plugins", f"saved profile {profile_name}", "package.json")
 
-    homes: list[tuple[Path, str]] = []
+    codex_homes: list[tuple[Path, str]] = []
     if codex_home:
-        homes.append((canonical_path(codex_home), "explicit --codex-home"))
-    elif os.environ.get("CODEX_HOME"):
-        homes.append((canonical_path(os.environ["CODEX_HOME"]), "CODEX_HOME"))
-    else:
-        homes.append((canonical_path(Path.home() / ".codex"), "Codex standard directory"))
-    for home, reason in homes:
+        codex_homes.append((canonical_path(codex_home), "explicit --codex-home"))
+    elif not dsh_home:
+        if os.environ.get("CODEX_HOME"):
+            codex_homes.append((canonical_path(os.environ["CODEX_HOME"]), "CODEX_HOME"))
+        else:
+            codex_homes.append((canonical_path(Path.home() / ".codex"), "Codex standard directory"))
+    for home, reason in codex_homes:
         add(home / "skills", "skills", reason, "SKILL.md")
         add(home / "plugins", "plugins", reason, "plugin.json")
-        config_file = home / "config.toml"
-        add(config_file, "config", reason, "config.toml")
+        add(home / "config.toml", "config", reason, "config.toml")
+
+    dsh_homes: list[tuple[Path, str]] = []
+    if dsh_home:
+        dsh_homes.append((canonical_path(dsh_home), "explicit --dsh-home"))
+    elif not codex_home:
+        if os.environ.get("DSH_HOME"):
+            dsh_homes.append((canonical_path(os.environ["DSH_HOME"]), "DSH_HOME"))
+        else:
+            dsh_homes.append((canonical_path(Path.home() / ".dsh"), "DeepSeek Harness standard directory"))
+    for home, reason in dsh_homes:
+        add(home / "skills", "skills", reason, "SKILL.md")
+        for plugin_root, profile_name in dsh_plugin_roots(home):
+            add(
+                plugin_root,
+                "plugins",
+                f"{reason} - profile {profile_name}",
+                "package.json",
+                item_count=dsh_package_count(plugin_root),
+            )
+        web_profile = dsh_profile_dir(home, "web")
+        add(web_profile / "package.json", "config", f"{reason} - web profile manifest", "package.json")
+        add(home / "cordis.patch.yml", "config", reason, "cordis.patch.yml")
 
     skill_dir = Path(__file__).resolve().parents[1]
     if skill_dir.parent.name == "skills":
@@ -487,7 +595,264 @@ def read_codex_config(path: Path | None) -> tuple[dict[str, bool], dict[str, dic
     return plugins, markets if isinstance(markets, dict) else {}, diagnostics
 
 
-def scan_skill_file(skill_md: Path, root: Path, alias: str, include_system: bool) -> tuple[dict[str, Any] | None, list[str]]:
+def read_dsh_profile_manifest(path: Path | None) -> tuple[set[str], set[str], list[str]]:
+    """Read the active bundle list and dependency names from a DSH profile manifest."""
+    diagnostics: list[str] = []
+    if path is None or not path.is_file():
+        return set(), set(), diagnostics
+    try:
+        data = json_load(path, {})
+    except CatalogError as exc:
+        return set(), set(), [str(exc)]
+    if not isinstance(data, dict):
+        return set(), set(), [f"DSH profile manifest is not an object: {path}"]
+    dsh_section = data.get("dsh")
+    profile_section = dsh_section.get("profile") if isinstance(dsh_section, dict) else {}
+    bundles = set()
+    if isinstance(profile_section, dict):
+        raw_bundles = profile_section.get("bundles") or []
+        if isinstance(raw_bundles, list):
+            bundles = {str(item) for item in raw_bundles if item}
+        else:
+            diagnostics.append(f"DSH profile bundles must be a list: {path}")
+    dependencies = set()
+    raw_dependencies = data.get("dependencies")
+    if isinstance(raw_dependencies, dict):
+        dependencies = {str(item) for item in raw_dependencies if item}
+    return bundles, dependencies, diagnostics
+
+
+def read_dsh_patch_names(path: Path | None) -> set[str]:
+    """Collect plugin names mounted by a profile cordis.patch.yml."""
+    if path is None or not path.is_file():
+        return set()
+    with contextlib.suppress(CatalogError):
+        text = read_limited(path)
+        return set(
+            match.group(1)
+            for match in re.finditer(r"^\s*name:\s*['\"]?([A-Za-z0-9@._/-]+)", text, re.MULTILINE)
+        )
+    return set()
+
+
+def collect_dsh_profile_states(home: Path) -> dict[str, tuple[set[str], set[str]]]:
+    """Index every initialized DSH profile as profile-name -> (active, dependency) names."""
+    states: dict[str, tuple[set[str], set[str]]] = {}
+    profiles = home / "profiles"
+    if not profiles.is_dir():
+        return states
+    for profile_dir in sorted(profiles.iterdir(), key=lambda item: item.name.lower()):
+        if not profile_dir.is_dir():
+            continue
+        manifest = profile_dir / "package.json"
+        patch = profile_dir / "cordis.patch.yml"
+        if not manifest.is_file() and not patch.is_file():
+            continue
+        bundles, dependencies, _ = read_dsh_profile_manifest(manifest)
+        patch_names = read_dsh_patch_names(patch)
+        states[profile_dir.name] = (set(bundles) | patch_names, dependencies)
+    return states
+
+
+def dsh_origin_from_path(package_dir: Path) -> str:
+    parts = package_dir.resolve(strict=False).parts
+    if "profiles" in parts:
+        index = parts.index("profiles")
+        if len(parts) > index + 1:
+            return parts[index + 1]
+    if "node_modules" in parts:
+        return "node_modules"
+    return package_dir.parent.name or "dsh"
+
+
+def repository_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = value.get("url")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    candidate = value.strip()
+    if candidate.startswith("github:"):
+        candidate = "https://github.com/" + candidate.removeprefix("github:").lstrip("/")
+    elif candidate.startswith("git+"):
+        candidate = candidate[4:]
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return normalize_url(candidate)
+
+
+def scan_dsh_plugin_package(
+    package_dir: Path,
+    alias: str,
+    active_names: set[str],
+    dependency_names: set[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Scan one top-level DSH npm package and return its capability item(s)."""
+    diagnostics: list[str] = []
+    manifest = package_dir / "package.json"
+    try:
+        data = json_load(manifest, None)
+    except CatalogError as exc:
+        return [], [str(exc)]
+    if not isinstance(data, dict):
+        return [], [f"DSH plugin manifest is not an object: {manifest}"]
+
+    plugin_meta_path = package_dir / "dsh.plugin.json"
+    plugin_meta: dict[str, Any] = {}
+    if plugin_meta_path.is_file():
+        with contextlib.suppress(CatalogError):
+            loaded = json_load(plugin_meta_path, None)
+            if isinstance(loaded, dict):
+                plugin_meta = loaded
+
+    dsh_section = data.get("dsh")
+    dshx_section = data.get("dshx")
+    plugin_dsh_keys = set(dsh_section) - {"profile"} if isinstance(dsh_section, dict) else set()
+    has_dsh = bool(plugin_dsh_keys)
+    has_dshx = isinstance(dshx_section, dict) and bool(dshx_section)
+    if not has_dsh and not has_dshx and not plugin_meta:
+        return [], []
+
+    name = str(data.get("name") or plugin_meta.get("id") or package_dir.name)
+    version = str(data.get("version") or plugin_meta.get("version") or "")
+    description = str(plugin_meta.get("description") or data.get("description") or "")
+    source_url = repository_url(data.get("repository") or data.get("homepage") or plugin_meta.get("repository"))
+    origin = dsh_origin_from_path(package_dir)
+    status = "enabled" if name in active_names else ("installed" if name in dependency_names else "cached")
+
+    contributes: dict[str, Any] = {}
+    if isinstance(dshx_section, dict) and isinstance(dshx_section.get("contributes"), dict):
+        contributes = dshx_section["contributes"]
+    elif isinstance(plugin_meta, dict) and isinstance(plugin_meta.get("contributes"), dict):
+        contributes = plugin_meta["contributes"]
+    declared_tools = contributes.get("tools") or []
+    declared_skills = contributes.get("skills") or []
+    capabilities = [str(item) for item in declared_tools if item] + [str(item) for item in declared_skills if item]
+    declared_skill_paths: dict[str, Path] = {}
+    raw_skill_paths = contributes.get("skillPaths") or {}
+    if isinstance(raw_skill_paths, dict):
+        package_root = package_dir.resolve(strict=False)
+        for skill_name, relative_path in raw_skill_paths.items():
+            if not skill_name or not isinstance(relative_path, str) or not relative_path.strip():
+                continue
+            candidate = (package_dir / relative_path).resolve(strict=False)
+            if not path_is_within(candidate, package_root):
+                diagnostics.append(f"DSH runtime skill path escapes plugin root: {relative_path}")
+            elif not candidate.is_file():
+                diagnostics.append(f"Missing DSH runtime skill metadata: {candidate}")
+            else:
+                declared_skill_paths[str(skill_name)] = candidate
+
+    files = [manifest]
+    if plugin_meta_path.is_file():
+        files.append(plugin_meta_path)
+    patch_file = package_dir / "cordis.patch.yml"
+    if patch_file.is_file():
+        files.append(patch_file)
+    fingerprint = hash_metadata(files)
+    plugin_id = f"dsh:plugin:{slug(name)}:{slug(origin)}"
+    items: list[dict[str, Any]] = [{
+        "id": plugin_id,
+        "ecosystem": "dsh",
+        "kind": "plugin",
+        "name": name,
+        "display_name": name,
+        "description_original": description,
+        "status": status,
+        "version": version,
+        "source_url": source_url,
+        "path": str(package_dir.resolve(strict=False)),
+        "origin": origin,
+        "capabilities": capabilities,
+        "fingerprint": fingerprint,
+    }]
+
+    local_skill_names: set[str] = set()
+    skills_dir = package_dir / "skills"
+    if skills_dir.is_dir():
+        for skill_md in walk_named(skills_dir, "SKILL.md", max_depth=4):
+            try:
+                metadata = parse_frontmatter(read_limited(skill_md))
+            except CatalogError as exc:
+                diagnostics.append(str(exc))
+                continue
+            skill_name = str(metadata.get("name") or skill_md.parent.name)
+            metadata_path = declared_skill_paths.get(skill_name, skill_md)
+            if metadata_path != skill_md:
+                try:
+                    metadata = parse_frontmatter(read_limited(metadata_path))
+                except CatalogError as exc:
+                    diagnostics.append(str(exc))
+                    continue
+            local_skill_names.add(skill_name)
+            items.append({
+                "id": f"dsh:plugin-skill:{slug(skill_name)}:{slug(name)}:{slug(origin)}",
+                "ecosystem": "dsh",
+                "kind": "plugin_skill",
+                "name": skill_name,
+                "display_name": skill_name,
+                "description_original": metadata.get("description", ""),
+                "status": status,
+                "version": version,
+                "source_url": source_url,
+                "path": str(metadata_path.parent.resolve(strict=False)),
+                "origin": f"{name}@{origin}",
+                "parent_plugin": plugin_id,
+                "fingerprint": hash_metadata([metadata_path]),
+            })
+    for skill_name in declared_skills:
+        skill_name = str(skill_name) if skill_name else ""
+        if not skill_name or skill_name in local_skill_names:
+            continue
+        metadata_path = declared_skill_paths.get(skill_name)
+        if metadata_path is not None:
+            try:
+                metadata = parse_frontmatter(read_limited(metadata_path))
+            except CatalogError as exc:
+                diagnostics.append(str(exc))
+                continue
+            items.append({
+                "id": f"dsh:plugin-skill:{slug(skill_name)}:{slug(name)}:{slug(origin)}",
+                "ecosystem": "dsh",
+                "kind": "plugin_skill",
+                "name": skill_name,
+                "display_name": skill_name,
+                "description_original": metadata.get("description", ""),
+                "status": status,
+                "version": version,
+                "source_url": source_url,
+                "path": str(metadata_path.parent.resolve(strict=False)),
+                "origin": f"{name}@{origin}",
+                "parent_plugin": plugin_id,
+                "fingerprint": hash_metadata([metadata_path]),
+            })
+            continue
+        items.append({
+            "id": f"dsh:plugin-skill:{slug(skill_name)}:{slug(name)}:{slug(origin)}",
+            "ecosystem": "dsh",
+            "kind": "plugin_skill",
+            "name": skill_name,
+            "display_name": skill_name,
+            "description_original": f"Declared by plugin {name}.",
+            "status": status,
+            "version": version,
+            "source_url": source_url,
+            "path": str(package_dir.resolve(strict=False)),
+            "path_is_virtual": True,
+            "origin": f"{name}@{origin}",
+            "parent_plugin": plugin_id,
+            "fingerprint": fingerprint,
+        })
+    return items, diagnostics
+
+
+def scan_skill_file(
+    skill_md: Path,
+    root: Path,
+    alias: str,
+    include_system: bool,
+    ecosystem: str = "codex",
+) -> tuple[dict[str, Any] | None, list[str]]:
     diagnostics: list[str] = []
     try:
         rel = skill_md.relative_to(root)
@@ -512,8 +877,8 @@ def scan_skill_file(skill_md: Path, root: Path, alias: str, include_system: bool
             interface = parse_openai_yaml(read_limited(openai_path))
     kind = "system_skill" if builtin else "skill"
     item = {
-        "id": f"codex:{kind}:{slug(name)}:{alias}",
-        "ecosystem": "codex",
+        "id": f"{ecosystem}:{kind}:{slug(name)}:{alias}",
+        "ecosystem": ecosystem,
         "kind": kind,
         "name": name,
         "display_name": interface.get("display_name") or name,
@@ -638,15 +1003,59 @@ def profile_from_args(config: dict[str, Any], args: argparse.Namespace) -> tuple
         profile["catalog_path"] = str(canonical_path(args.catalog))
     if getattr(args, "include_system", None) is not None:
         profile["include_system"] = bool(args.include_system)
+    if getattr(args, "dsh_profile", None):
+        profile["dsh_profile"] = args.dsh_profile
     if getattr(args, "scan_depth", None) is not None:
         profile["scan_depth"] = args.scan_depth
     return name, profile
 
 
-def scan_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
-    agent = profile.get("agent", "codex")
-    if agent != "codex":
-        raise CatalogError(f"Agent adapter '{agent}' is not implemented; first release supports codex")
+def finalize_inventory(
+    items: list[dict[str, Any]],
+    diagnostics: list[str],
+    profile_name: str,
+) -> dict[str, Any]:
+    path_deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in items:
+        item_path = item.get("path")
+        if (
+            item_path
+            and not item.get("path_is_virtual")
+            and item.get("kind") in {"skill", "system_skill", "plugin_skill", "plugin"}
+        ):
+            path_key = os.path.normcase(str(canonical_path(item_path)))
+            key = (str(item.get("kind")), path_key)
+            if key in path_deduped:
+                diagnostics.append(f"Duplicate capability path collapsed: {item_path}")
+                continue
+            path_deduped[key] = item
+        else:
+            path_deduped[(str(item.get("kind")), str(item.get("id")))] = item
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in path_deduped.values():
+        previous = deduped.get(item["id"])
+        if previous is None:
+            deduped[item["id"]] = item
+            continue
+        preferred = item
+        if previous.get("status") == "enabled" and item.get("status") != "enabled":
+            preferred = previous
+        elif previous.get("status") == item.get("status") and version_key(previous.get("version")) > version_key(item.get("version")):
+            preferred = previous
+        deduped[item["id"]] = preferred
+        diagnostics.append(f"Duplicate capability collapsed: {item['id']}")
+    ordered = sorted(deduped.values(), key=lambda item: (item["kind"], item["name"].lower(), item["id"]))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "profile": profile_name,
+        "scanned_at": utc_now(),
+        "items": ordered,
+        "diagnostics": sorted(set(diagnostics)),
+    }
+
+
+def scan_codex_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
     include_system = bool(profile.get("include_system", False))
     scan_depth = int(profile.get("scan_depth", MAX_SCAN_DEPTH))
     if scan_depth < 0:
@@ -663,7 +1072,7 @@ def scan_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
             diagnostics.append(f"Missing skill root: {root}")
             continue
         for skill_md in walk_named(root, "SKILL.md", max_depth=scan_depth):
-            item, item_diagnostics = scan_skill_file(skill_md, root, entry["alias"], include_system)
+            item, item_diagnostics = scan_skill_file(skill_md, root, entry["alias"], include_system, ecosystem="codex")
             diagnostics.extend(item_diagnostics)
             if item:
                 items.append(item)
@@ -695,41 +1104,59 @@ def scan_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
             "origin": "codex-config",
             "fingerprint": hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest(),
         })
+    return finalize_inventory(items, diagnostics, profile_name)
 
-    path_deduped: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in items:
-        item_path = item.get("path")
-        if item_path and item.get("kind") in {"skill", "system_skill", "plugin_skill", "plugin"}:
-            path_key = os.path.normcase(str(canonical_path(item_path)))
-            key = (str(item.get("kind")), path_key)
-            if key in path_deduped:
-                diagnostics.append(f"Duplicate capability path collapsed: {item_path}")
-                continue
-            path_deduped[key] = item
-        else:
-            path_deduped[(str(item.get("kind")), str(item.get("id")))] = item
 
-    deduped: dict[str, dict[str, Any]] = {}
-    for item in path_deduped.values():
-        previous = deduped.get(item["id"])
-        if previous is None:
-            deduped[item["id"]] = item
+def scan_dsh_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
+    include_system = bool(profile.get("include_system", False))
+    scan_depth = int(profile.get("scan_depth", MAX_SCAN_DEPTH))
+    if scan_depth < 0:
+        raise CatalogError("scan_depth must be zero or greater")
+    skill_roots = normalize_root_entries(profile.get("skill_roots", []), "skills")
+    plugin_roots = normalize_root_entries(profile.get("plugin_roots", []), "plugins")
+    home = dsh_home_dir(profile.get("dsh_home"))
+    dsh_profile = str(profile.get("dsh_profile") or "web")
+    manifest_path = canonical_path(profile.get("dsh_config")) if profile.get("dsh_config") else dsh_profile_dir(home, dsh_profile) / "package.json"
+    patch_path = canonical_path(profile.get("dsh_patch")) if profile.get("dsh_patch") else dsh_profile_dir(home, dsh_profile) / "cordis.patch.yml"
+    bundles, dependencies, diagnostics = read_dsh_profile_manifest(manifest_path)
+    patch_names = read_dsh_patch_names(patch_path)
+    selected_state = (set(bundles) | patch_names, dependencies)
+    profile_states = collect_dsh_profile_states(home)
+    profile_states.setdefault(dsh_profile, selected_state)
+    items: list[dict[str, Any]] = []
+    for entry in skill_roots:
+        root = canonical_path(entry["path"])
+        if not root.is_dir():
+            diagnostics.append(f"Missing skill root: {root}")
             continue
-        preferred = item
-        if previous.get("status") == "enabled" and item.get("status") != "enabled":
-            preferred = previous
-        elif previous.get("status") == item.get("status") and version_key(previous.get("version")) > version_key(item.get("version")):
-            preferred = previous
-        deduped[item["id"]] = preferred
-        diagnostics.append(f"Duplicate capability collapsed: {item['id']}")
-    ordered = sorted(deduped.values(), key=lambda item: (item["kind"], item["name"].lower(), item["id"]))
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "profile": profile_name,
-        "scanned_at": utc_now(),
-        "items": ordered,
-        "diagnostics": sorted(set(diagnostics)),
-    }
+        for skill_md in walk_named(root, "SKILL.md", max_depth=scan_depth):
+            item, item_diagnostics = scan_skill_file(skill_md, root, entry["alias"], include_system, ecosystem="dsh")
+            diagnostics.extend(item_diagnostics)
+            if item:
+                items.append(item)
+    for entry in plugin_roots:
+        root = canonical_path(entry["path"])
+        if not root.is_dir():
+            diagnostics.append(f"Missing plugin root: {root}")
+            continue
+        for package_dir in iter_top_level_dsh_packages(root):
+            origin = dsh_origin_from_path(package_dir)
+            active_names, dependency_names = profile_states.get(origin, selected_state)
+            plugin_items, item_diagnostics = scan_dsh_plugin_package(
+                package_dir, entry["alias"], active_names, dependency_names
+            )
+            diagnostics.extend(item_diagnostics)
+            items.extend(plugin_items)
+    return finalize_inventory(items, diagnostics, profile_name)
+
+
+def scan_profile(profile_name: str, profile: dict[str, Any]) -> dict[str, Any]:
+    agent = profile.get("agent", "codex")
+    if agent == "codex":
+        return scan_codex_profile(profile_name, profile)
+    if agent == "dsh":
+        return scan_dsh_profile(profile_name, profile)
+    raise CatalogError(f"Agent adapter '{agent}' is not implemented; supported agents: codex, dsh")
 
 
 def compute_diff(inventory: dict[str, Any], previous_state: dict[str, Any] | None) -> dict[str, Any]:
@@ -1178,7 +1605,7 @@ def installer_resolution(agent: str, target: str, skill_roots: list[dict[str, st
         names = [str(adapter["plugin_installer"])]
     else:
         names = [str(adapter["skill_installer"])]
-    return {
+    result: dict[str, Any] = {
         "agent": agent,
         "target": target,
         "supported": True,
@@ -1186,6 +1613,12 @@ def installer_resolution(agent: str, target: str, skill_roots: list[dict[str, st
         "detected_locally": any(name in installed_names for name in names),
         "note": "The hosting agent must invoke this installer; this script never installs packages.",
     }
+    if names[0] == "none":
+        result.update({
+            "supports_direct_install": False,
+            "note": str(adapter.get("skill_install_note") or result["note"]),
+        })
+    return result
 
 
 def output_result(value: Any, args: argparse.Namespace) -> None:
@@ -1224,6 +1657,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile")
     parser.add_argument("--agent", default=None)
     parser.add_argument("--codex-home")
+    parser.add_argument("--dsh-home")
+    parser.add_argument("--dsh-profile", default=None, help="target DSH profile name (default web)")
     parser.add_argument("--skill-root", action="append")
     parser.add_argument("--linked-root", action="append", help="confirm a directory link as an independent skill root")
     parser.add_argument("--plugin-root", action="append")
@@ -1273,8 +1708,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def command_configure(args: argparse.Namespace, config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     profile_name = args.profile or config.get("active_profile", "default")
-    codex_home = canonical_path(args.codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    skill_values: list[Any] = list(args.skill_root or [str(codex_home / "skills")])
+    agent = str(args.agent or ("dsh" if args.dsh_home else "codex"))
+    if agent == "dsh":
+        home = dsh_home_dir(args.dsh_home)
+        dsh_profile = str(args.dsh_profile or "web")
+        skill_values: list[Any] = list(args.skill_root or [str(home / "skills")])
+        plugin_values: list[str] = list(args.plugin_root or [str(root) for root, _ in dsh_plugin_roots(home, dsh_profile)])
+        catalog = canonical_path(args.catalog or home / "CAPABILITIES.zh-CN.md")
+    else:
+        codex_home = canonical_path(args.codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        skill_values = list(args.skill_root or [str(codex_home / "skills")])
+        plugin_values = list(args.plugin_root or [str(codex_home / "plugins")])
+        catalog = canonical_path(args.catalog or codex_home / "CAPABILITIES.zh-CN.md")
     for raw_link in args.linked_root or []:
         source_link = absolute_path(raw_link)
         if not is_directory_link(source_link):
@@ -1289,20 +1734,26 @@ def command_configure(args: argparse.Namespace, config_path: Path, config: dict[
             "source": "linked-root",
             "confirmed": True,
         })
-    plugin_values = args.plugin_root or [str(codex_home / "plugins")]
-    catalog = canonical_path(args.catalog or codex_home / "CAPABILITIES.zh-CN.md")
     if args.scan_depth is not None and args.scan_depth < 0:
         raise CatalogError("--scan-depth must be zero or greater")
-    profile = {
-        "agent": args.agent or "codex",
+    profile: dict[str, Any] = {
+        "agent": agent,
         "skill_roots": normalize_root_entries(skill_values, "skills"),
         "plugin_roots": normalize_root_entries(plugin_values, "plugins"),
-        "codex_config": str(codex_home / "config.toml"),
         "catalog_path": str(catalog),
         "include_system": bool(args.include_system),
         "scan_depth": args.scan_depth if args.scan_depth is not None else MAX_SCAN_DEPTH,
         "configured_at": utc_now(),
     }
+    if agent == "dsh":
+        profile.update({
+            "dsh_home": str(home),
+            "dsh_profile": dsh_profile,
+            "dsh_config": str(dsh_profile_dir(home, dsh_profile) / "package.json"),
+            "dsh_patch": str(dsh_profile_dir(home, dsh_profile) / "cordis.patch.yml"),
+        })
+    else:
+        profile["codex_config"] = str(codex_home / "config.toml")
     updated = dict(config)
     updated["profiles"] = dict(config.get("profiles", {}))
     updated["profiles"][profile_name] = profile
@@ -1315,6 +1766,11 @@ def command_configure(args: argparse.Namespace, config_path: Path, config: dict[
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(encoding="utf-8")
     parser = build_parser()
     args = parser.parse_args(argv)
     config_path = canonical_path(args.config)
@@ -1333,7 +1789,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "discover":
-            output_result(discover_paths(config_path, args.codex_home), args)
+            output_result(discover_paths(config_path, args.codex_home, args.dsh_home), args)
             return 0
         config = load_config(config_path)
         if args.command == "configure":
@@ -1349,6 +1805,31 @@ def main(argv: list[str] | None = None) -> int:
             if not args.plugin_root:
                 profile["plugin_roots"] = normalize_root_entries([home / "plugins"], "plugins")
             profile["codex_config"] = str(home / "config.toml")
+        if args.dsh_home:
+            home = dsh_home_dir(args.dsh_home)
+            dsh_profile = str(args.dsh_profile or profile.get("dsh_profile") or "web")
+            if not args.skill_root:
+                profile["skill_roots"] = normalize_root_entries([home / "skills"], "skills")
+            if not args.plugin_root:
+                profile["plugin_roots"] = normalize_root_entries(
+                    [root for root, _ in dsh_plugin_roots(home, dsh_profile)], "plugins"
+                )
+            profile.update({
+                "agent": "dsh",
+                "dsh_home": str(home),
+                "dsh_profile": dsh_profile,
+                "dsh_config": str(dsh_profile_dir(home, dsh_profile) / "package.json"),
+                "dsh_patch": str(dsh_profile_dir(home, dsh_profile) / "cordis.patch.yml"),
+            })
+        elif args.dsh_profile:
+            home = dsh_home_dir(profile.get("dsh_home"))
+            dsh_profile = str(args.dsh_profile)
+            profile.update({
+                "dsh_home": str(home),
+                "dsh_profile": dsh_profile,
+                "dsh_config": str(dsh_profile_dir(home, dsh_profile) / "package.json"),
+                "dsh_patch": str(dsh_profile_dir(home, dsh_profile) / "cordis.patch.yml"),
+            })
         state_file = state_path(config_path, profile_name)
         previous_state = json_load(state_file, None)
         if args.command == "status":
